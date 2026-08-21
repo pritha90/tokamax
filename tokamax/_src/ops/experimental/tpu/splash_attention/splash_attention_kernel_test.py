@@ -24,6 +24,8 @@ import hypothesis as hp
 import hypothesis.strategies as hps
 import jax
 from jax import random
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 from tokamax._src.ops.experimental.tpu.splash_attention import base
@@ -737,6 +739,382 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
     )
     with self.assertRaisesRegex(ValueError, "CausalMask"):
       splash.make_splash_mha_single_device(local, config=config)
+
+
+def _dropout_reference(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    mask: jax.Array,
+    dropout_mask: jax.Array | None,
+    dropout_rate: float,
+    is_mqa: bool,
+) -> jax.Array:
+  """Dense attention that drops the weights `dropout_mask` marks as dropped.
+
+  This mirrors what the kernel does: the softmax denominator is the *undropped*
+  one (dropout is applied to the normalized weights, not to the logits), and the
+  survivors are rescaled by 1 / (1 - rate).
+  """
+  if is_mqa:
+    k = jnp.broadcast_to(k[None], (q.shape[0], *k.shape))
+    v = jnp.broadcast_to(v[None], (q.shape[0], *v.shape))
+  logits = jnp.einsum("hqd,hkd->hqk", q, k).astype(jnp.float32)
+  logits = jnp.where(mask[None], logits, base.DEFAULT_MASK_VALUE)
+  p = jax.nn.softmax(logits, axis=-1)
+  if dropout_mask is not None:
+    p = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
+  o = jnp.einsum("hqk,hkd->hqd", p, v.astype(jnp.float32))
+  return o.astype(q.dtype)
+
+
+def _rel_l2(x: jax.Array, y: jax.Array) -> float:
+  """Relative L2 error ‖x - y‖ / ‖y‖."""
+  x = np.asarray(x, np.float64)
+  y = np.asarray(y, np.float64)
+  return float(np.linalg.norm(x - y) / (np.linalg.norm(y) + 1e-12))
+
+
+def _get_dropout_mask_kernel(
+    prng_key_ref,
+    out_ref,
+    *,
+    bq: int,
+    bkv_compute: int,
+    dropout_rate: float,
+):
+  # pylint: disable-next=protected-access
+  out_ref[...] = splash._generate_blockwise_dropout_mask(
+      prng_key_ref,
+      head_idx=pl.program_id(0),
+      q_block_idx=pl.program_id(1),
+      kv_block_idx=pl.program_id(2),
+      q_block_size=bq,
+      kv_block_size=bkv_compute,
+      dropout_rate=dropout_rate,
+  )
+
+
+def _get_dropout_mask(
+    num_heads: int,
+    q_seq_len: int,
+    kv_seq_len: int,
+    config: splash.SplashConfig,
+    prng_key: jax.Array,
+) -> jax.Array:
+  """Materializes the dropout mask the attention kernels generate internally.
+
+  Test-only: the attention kernels never build this array, they regenerate one
+  (bq, block_kv_compute) tile at a time. The `prng_key` must be the same one
+  passed to the kernel, and `config` the same config, or the masks will not
+  correspond.
+
+  Returns:
+    A [num_heads, q_seq_len, kv_seq_len] bool array; True means "dropped".
+  """
+  prng_key = pltpu.to_pallas_key(prng_key)
+  bq, bkv_compute = config.block_q, config.block_kv_compute
+  assert bkv_compute is not None
+  grid = (num_heads, q_seq_len // bq, kv_seq_len // bkv_compute)
+
+  kernel_name = "get_dropout_mask"
+  with jax.named_scope(kernel_name):
+    return pl.pallas_call(
+        partial(
+            _get_dropout_mask_kernel,
+            bq=bq,
+            bkv_compute=bkv_compute,
+            dropout_rate=config.dropout_rate,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[],
+            out_specs=pl.BlockSpec(
+                (None, bq, bkv_compute), lambda h, i, j, *_: (h, i, j)
+            ),
+            grid=grid,
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (num_heads, q_seq_len, kv_seq_len), jnp.bool_
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel", "parallel")
+        ),
+        name=kernel_name,
+        interpret=config.interpret,
+    )(prng_key)
+
+
+@test_utils.thread_unsafe_test_class()
+class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
+  """Attention dropout: the mask is generated in-kernel, never materialized.
+
+  The kernel regenerates each (head, q block, kv block) tile of the mask from
+  `prng_key`, in both the forward and the backward pass. These tests pin that
+  down against a dense reference fed with the same mask, obtained from the
+  test-only `_get_dropout_mask` above.
+  """
+
+  NUM_HEADS = 2
+  SEQ_LEN = 512
+  HEAD_DIM = 128
+  BLOCK = 128
+
+  def setUp(self):
+    if jax.default_backend() != "tpu":
+      self.skipTest("Only supported on TPUs.")
+    super().setUp()
+
+  def _config(self, dropout_rate: float, **kwargs) -> splash.SplashConfig:
+    block = self.BLOCK
+    return splash.SplashConfig(
+        block_q=block,
+        block_kv=block,
+        block_kv_compute=block,
+        block_q_dkv=block,
+        block_kv_dkv=block,
+        block_kv_dkv_compute=block,
+        dropout_rate=dropout_rate,
+        use_base2_exp=False,
+        interpret=self.INTERPRET,
+        **kwargs,
+    )
+
+  def _inputs(self, is_mqa: bool = False, seed: int = 0):
+    k1, k2, k3, k4 = random.split(random.key(seed), 4)
+    seq_len, head_dim = self.SEQ_LEN, self.HEAD_DIM
+    q_shape = (self.NUM_HEADS, seq_len, head_dim)
+    kv_shape = (seq_len, head_dim) if is_mqa else q_shape
+    return (
+        random.uniform(k1, q_shape, dtype=jnp.float32),
+        random.uniform(k2, kv_shape, dtype=jnp.float32),
+        random.uniform(k3, kv_shape, dtype=jnp.float32),
+        random.uniform(k4, q_shape, dtype=jnp.float32),  # do
+    )
+
+  def _mask(self, is_causal: bool) -> mask_lib.Mask:
+    shape = (self.SEQ_LEN, self.SEQ_LEN)
+    return mask_lib.CausalMask(shape) if is_causal else mask_lib.FullMask(shape)
+
+  def _attn(self, mask, config, is_mqa, is_dynamic_mask=False):
+    if is_dynamic_mask:
+      make_fn = (
+          splash.make_dynamic_splash_mqa
+          if is_mqa
+          else splash.make_dynamic_splash_mha
+      )
+      return make_fn(jnp.array(mask[:, :]), config=config)
+    make_fn = (
+        splash.make_splash_mqa_single_device
+        if is_mqa
+        else splash.make_splash_mha_single_device
+    )
+    return make_fn(mask, config=config)
+
+  @parameterized.product(
+      dropout_rate=(0.1, 0.5),
+      is_mqa=(False, True),
+      is_causal=(False, True),
+      is_dynamic_mask=(False, True),
+  )
+  def test_dropout_fwd(
+      self, dropout_rate, is_mqa, is_causal, is_dynamic_mask
+  ):
+    q, k, v, _ = self._inputs(is_mqa)
+    mask = self._mask(is_causal)
+    config = self._config(dropout_rate)
+    attn = self._attn(mask, config, is_mqa, is_dynamic_mask)
+    prng_key = random.key(1234)
+
+    o = jax.jit(partial(attn, prng_key=prng_key))(q, k, v)
+    dropout_mask = jax.jit(
+        partial(
+            _get_dropout_mask,
+            self.NUM_HEADS,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+            config,
+        )
+    )(prng_key)
+    o_ref = _dropout_reference(
+        q, k, v, jnp.array(mask[:, :]), dropout_mask, dropout_rate, is_mqa
+    )
+    self._assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
+
+    # The mask is a Bernoulli draw per element, so over 2 * 512 * 512 elements
+    # the realized rate is within a fraction of a percent of the target.
+    self.assertAlmostEqual(float(jnp.mean(dropout_mask)), dropout_rate, delta=5e-3)
+
+  @parameterized.product(is_mqa=(False, True), is_dynamic_mask=(False, True))
+  def test_dropout_bwd(self, is_mqa, is_dynamic_mask):
+    """dq/dk/dv against autodiff of the dense reference under the same mask.
+
+    Compared with a relative L2 norm rather than elementwise `allclose`: the
+    kernel recomputes `ds = (dp - di) * p` from the saved logsumexp, so it
+    disagrees with dense autodiff by a large *relative* amount on the handful
+    of dq/dk entries that are near zero. A rate=0 run of this same comparison
+    already shows such outliers (~1% of entries beyond atol=rtol=5e-2), so an
+    elementwise bound here would be measuring the kernel's flash-vs-dense
+    error, not dropout. The thresholds below sit ~2x above the measured
+    error, which is itself the same order as the rate=0 kernel's.
+    """
+    dropout_rate = 0.25
+    q, k, v, do = self._inputs(is_mqa)
+    mask = self._mask(is_causal=True)
+    dense_mask = jnp.array(mask[:, :])
+    config = self._config(dropout_rate)
+    attn = self._attn(mask, config, is_mqa, is_dynamic_mask)
+    prng_key = random.key(1234)
+    dropout_mask = jax.jit(
+        partial(
+            _get_dropout_mask,
+            self.NUM_HEADS,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+            config,
+        )
+    )(prng_key)
+
+    def loss(fn):
+      return lambda q, k, v: jnp.sum(fn(q, k, v) * do)
+
+    grads = jax.jit(
+        jax.grad(
+            loss(partial(attn, prng_key=prng_key)), argnums=(0, 1, 2)
+        )
+    )(q, k, v)
+    grads_ref = jax.jit(
+        jax.grad(
+            loss(
+                lambda q, k, v: _dropout_reference(
+                    q, k, v, dense_mask, dropout_mask, dropout_rate, is_mqa
+                )
+            ),
+            argnums=(0, 1, 2),
+        )
+    )(q, k, v)
+    # dv is exactly linear in the dropout mask, so it is held to a much tighter
+    # bound than dq/dk: any disagreement about *which* weights were dropped
+    # shows up here first.
+    tolerances = dict(dq=2e-2, dk=2e-2, dv=1e-3)
+    for name, g, g_ref in zip(("dq", "dk", "dv"), grads, grads_ref):
+      with self.subTest(name):
+        self.assertTrue(jnp.isfinite(g).all())
+        self.assertTupleEqual(g.shape, g_ref.shape)
+        self.assertLess(_rel_l2(g, g_ref), tolerances[name])
+
+  def test_dropout_rate_zero_is_a_no_op(self):
+    """rate=0 must leave the kernel bit-identical, key or no key."""
+    q, k, v, _ = self._inputs()
+    mask = self._mask(is_causal=True)
+    attn = self._attn(mask, self._config(0.0), is_mqa=False)
+    o_no_key = jax.jit(attn)(q, k, v)
+    o_with_key = jax.jit(partial(attn, prng_key=random.key(1234)))(q, k, v)
+    self._assert_array_equal(o_no_key, o_with_key)
+
+    # ... and it must differ from a run that actually drops.
+    dropout_attn = self._attn(mask, self._config(0.25), is_mqa=False)
+    o_dropout = jax.jit(partial(dropout_attn, prng_key=random.key(1234)))(
+        q, k, v
+    )
+    self.assertGreater(float(jnp.abs(o_dropout - o_no_key).max()), 1e-2)
+
+  def test_dropout_is_deterministic_in_the_key(self):
+    """Same key -> bit-identical; different key -> a different mask."""
+    q, k, v, _ = self._inputs()
+    attn = self._attn(self._mask(is_causal=True), self._config(0.25), False)
+    run = lambda key: jax.jit(partial(attn, prng_key=key))(q, k, v)
+    self._assert_array_equal(run(random.key(1234)), run(random.key(1234)))
+    self.assertGreater(
+        float(jnp.abs(run(random.key(1234)) - run(random.key(4321))).max()),
+        1e-2,
+    )
+
+  def test_dropout_fwd_and_bwd_use_the_same_mask(self):
+    """dv is the cleanest probe: dv = sum_i pr_ij do_i uses the dropped weights.
+
+    If the backward regenerated a different mask than the forward, dv would be
+    wrong by O(rate) while still looking plausible, so compare it against the
+    reference at a tight tolerance.
+    """
+    dropout_rate = 0.5
+    q, k, v, do = self._inputs()
+    mask = self._mask(is_causal=True)
+    config = self._config(dropout_rate)
+    attn = self._attn(mask, config, is_mqa=False)
+    prng_key = random.key(7)
+    dropout_mask = jax.jit(
+        partial(
+            _get_dropout_mask,
+            self.NUM_HEADS,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+            config,
+        )
+    )(prng_key)
+
+    _, vjp = jax.vjp(partial(attn, prng_key=prng_key), q, k, v)
+    _, _, dv = vjp(do)
+    dense_mask = jnp.array(mask[:, :])
+    _, vjp_ref = jax.vjp(
+        lambda q, k, v: _dropout_reference(
+            q, k, v, dense_mask, dropout_mask, dropout_rate, is_mqa=False
+        ),
+        q,
+        k,
+        v,
+    )
+    _, _, dv_ref = vjp_ref(do)
+    self._assert_allclose(dv, dv_ref, atol=5e-3, rtol=5e-3)
+
+  def test_dropout_without_a_key_raises(self):
+    q, k, v, _ = self._inputs()
+    attn = self._attn(self._mask(is_causal=True), self._config(0.25), False)
+    with self.assertRaisesRegex(ValueError, "prng_key is required"):
+      jax.jit(attn)(q, k, v)
+
+  def test_invalid_dropout_rate_raises(self):
+    for rate in (-0.1, 1.0, 1.5):
+      with self.assertRaisesRegex(ValueError, "dropout_rate must be in"):
+        self._config(rate)
+
+  def test_mismatched_fwd_bwd_blocks_raise(self):
+    """The bwd regenerates the mask, so its tiles must match the fwd's."""
+    block = self.BLOCK
+    with self.assertRaisesRegex(ValueError, "backward tiles to match"):
+      splash.SplashConfig(
+          block_q=block,
+          block_kv=block,
+          block_kv_compute=block,
+          block_q_dkv=2 * block,
+          block_kv_dkv=block,
+          block_kv_dkv_compute=block,
+          dropout_rate=0.25,
+      )
+
+  def test_get_dropout_mask_is_blockwise_and_head_dependent(self):
+    """Different (head, q block, kv block) tiles must get independent draws."""
+    config = self._config(0.5)
+    mask = jax.jit(
+        partial(
+            _get_dropout_mask,
+            self.NUM_HEADS,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+            config,
+        )
+    )(random.key(0))
+    self.assertEqual(
+        mask.shape, (self.NUM_HEADS, self.SEQ_LEN, self.SEQ_LEN)
+    )
+    self.assertEqual(mask.dtype, jnp.bool_)
+    block = self.BLOCK
+    tile = lambda h, i, j: mask[
+        h, i * block : (i + 1) * block, j * block : (j + 1) * block
+    ]
+    self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(1, 0, 0))))
+    self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(0, 1, 0))))
+    self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(0, 0, 1))))
 
 
 if __name__ == "__main__":

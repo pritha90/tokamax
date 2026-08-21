@@ -241,6 +241,7 @@ def _ring_attention_bwd(
         out,
         logsumexp,
         local_dkv_mask_info,
+        None,  # prng_key: ring attention does not expose attention dropout.
     )
 
     attn_bwd = functools.partial(
@@ -253,7 +254,7 @@ def _ring_attention_bwd(
         fwd_mask_sparsity=fwd_mask_sparsity,
         dkv_mask_sparsity=dkv_mask_sparsity,
     )
-    _, _, dq_i, dk_i, dv_i, _, dsinks, _ = attn_bwd(
+    _, _, dq_i, dk_i, dv_i, _, dsinks, _, _ = attn_bwd(
         res=residuals_for_chunk, grads=do
     )
     dv_next = shift(dv_accum + dv_i.astype(dv_accum.dtype))

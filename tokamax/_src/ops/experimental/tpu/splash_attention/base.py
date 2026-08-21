@@ -65,6 +65,7 @@ type SplashResidualsType = tuple[
     jax.Array,  # out
     jax.Array,  # logsumexp
     MaskInfo | None,  # dkv_mask_info
+    jax.Array | None,  # prng_key
 ]
 
 
