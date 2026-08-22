@@ -818,6 +818,79 @@ def _get_dropout_mask(
     )(prng_key)
 
 
+def _restated_dropout_mask_kernel(
+    prng_key_ref,
+    out_ref,
+    *,
+    bq: int,
+    bkv: int,
+    dropout_rate: float,
+):
+  """Restates the derivation `_generate_blockwise_dropout_mask` implements."""
+  key_h = random.fold_in(prng_key_ref[...], pl.program_id(0))
+  for i in range(out_ref.shape[0] // bq):
+    key_q = random.fold_in(key_h, i)
+    for j in range(out_ref.shape[1] // bkv):
+      out_ref[i * bq : (i + 1) * bq, j * bkv : (j + 1) * bkv] = (
+          random.bernoulli(random.fold_in(key_q, j), dropout_rate, (bq, bkv))
+      )
+
+
+def _restated_dropout_mask(
+    num_heads: int,
+    q_seq_len: int,
+    kv_seq_len: int,
+    config: splash.SplashConfig,
+    prng_key: jax.Array,
+) -> jax.Array:
+  """Second statement of the dropout derivation, for `_get_dropout_mask`.
+
+  `_get_dropout_mask` calls the kernel's own `_generate_blockwise_dropout_mask`,
+  so on its own it can only show that the forward and backward passes agree with
+  each other --- it cannot show that they agree with the *intended* scheme. This
+  spells the scheme out a second time: fold head, then q block, then kv block
+  into the key, in that order, and draw a (block_q, block_kv_compute) tile.
+
+  The two differ structurally on purpose. Here the grid is over heads alone and
+  the block loop is unrolled inside the kernel with Python ints, so the block
+  coordinates never come from `pl.program_id` and never pass through a
+  `BlockSpec` index map. A q/kv transposition in either of those --- which both
+  sides of a same-grid comparison would make identically --- shows up as a
+  mismatch.
+
+  Returns:
+    A [num_heads, q_seq_len, kv_seq_len] bool array; True means "dropped".
+  """
+  prng_key = pltpu.to_pallas_key(prng_key)
+  bq, bkv = config.block_q, config.block_kv_compute
+  assert bkv is not None
+
+  return pl.pallas_call(
+      partial(
+          _restated_dropout_mask_kernel,
+          bq=bq,
+          bkv=bkv,
+          dropout_rate=config.dropout_rate,
+      ),
+      grid_spec=pltpu.PrefetchScalarGridSpec(
+          num_scalar_prefetch=1,
+          in_specs=[],
+          out_specs=pl.BlockSpec(
+              (None, q_seq_len, kv_seq_len), lambda h, *_: (h, 0, 0)
+          ),
+          grid=(num_heads,),
+      ),
+      out_shape=jax.ShapeDtypeStruct(
+          (num_heads, q_seq_len, kv_seq_len), jnp.bool_
+      ),
+      compiler_params=pltpu.CompilerParams(
+          dimension_semantics=("parallel",)
+      ),
+      name="restated_dropout_mask",
+      interpret=config.interpret,
+  )(prng_key)
+
+
 @test_utils.thread_unsafe_test_class()
 class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
   """Attention dropout: the mask is generated in-kernel, never materialized.
@@ -1106,6 +1179,24 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(1, 0, 0))))
     self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(0, 1, 0))))
     self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(0, 0, 1))))
+
+  def test_dropout_mask_matches_a_restated_derivation(self):
+    """The mask is the documented function of the key and block coordinates.
+
+    Pins the derivation itself against `_restated_dropout_mask`: bit-exact,
+    since both draw from the same key with the same rate. Changing the order
+    the coordinates are folded in, or the shape of a tile, breaks this test
+    without breaking any of the ones above, which only require the forward and
+    backward passes to agree with each other.
+    """
+    for rate in (0.25, 0.5):
+      with self.subTest(rate=rate):
+        config = self._config(rate)
+        args = (self.NUM_HEADS, self.SEQ_LEN, self.SEQ_LEN, config)
+        key = random.key(7)
+        actual = jax.jit(partial(_get_dropout_mask, *args))(key)
+        expected = jax.jit(partial(_restated_dropout_mask, *args))(key)
+        self._assert_array_equal(actual, expected)
 
   def test_reference_vjp_matches_autodiff_under_dropout(self):
     """Covers the hand-written backward in `base.attention_reference_vjp`.
