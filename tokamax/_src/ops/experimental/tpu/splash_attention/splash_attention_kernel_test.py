@@ -741,33 +741,6 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       splash.make_splash_mha_single_device(local, config=config)
 
 
-def _dropout_reference(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    mask: jax.Array,
-    dropout_mask: jax.Array | None,
-    dropout_rate: float,
-    is_mqa: bool,
-) -> jax.Array:
-  """Dense attention that drops the weights `dropout_mask` marks as dropped.
-
-  This mirrors what the kernel does: the softmax denominator is the *undropped*
-  one (dropout is applied to the normalized weights, not to the logits), and the
-  survivors are rescaled by 1 / (1 - rate).
-  """
-  if is_mqa:
-    k = jnp.broadcast_to(k[None], (q.shape[0], *k.shape))
-    v = jnp.broadcast_to(v[None], (q.shape[0], *v.shape))
-  logits = jnp.einsum("hqd,hkd->hqk", q, k).astype(jnp.float32)
-  logits = jnp.where(mask[None], logits, base.DEFAULT_MASK_VALUE)
-  p = jax.nn.softmax(logits, axis=-1)
-  if dropout_mask is not None:
-    p = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
-  o = jnp.einsum("hqk,hkd->hqd", p, v.astype(jnp.float32))
-  return o.astype(q.dtype)
-
-
 def _rel_l2(x: jax.Array, y: jax.Array) -> float:
   """Relative L2 error ‖x - y‖ / ‖y‖."""
   x = np.asarray(x, np.float64)
@@ -936,8 +909,14 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
             config,
         )
     )(prng_key)
-    o_ref = _dropout_reference(
-        q, k, v, jnp.array(mask[:, :]), dropout_mask, dropout_rate, is_mqa
+    o_ref = base.attention_reference(
+        q,
+        k,
+        v,
+        jnp.array(mask[:, :]),
+        dropout_mask=dropout_mask,
+        is_mqa=is_mqa,
+        dropout_rate=dropout_rate,
     )
     self._assert_allclose(o, o_ref, atol=2e-2, rtol=2e-2)
 
@@ -986,8 +965,14 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     grads_ref = jax.jit(
         jax.grad(
             loss(
-                lambda q, k, v: _dropout_reference(
-                    q, k, v, dense_mask, dropout_mask, dropout_rate, is_mqa
+                lambda q, k, v: base.attention_reference(
+                    q,
+                    k,
+                    v,
+                    dense_mask,
+                    dropout_mask=dropout_mask,
+                    is_mqa=is_mqa,
+                    dropout_rate=dropout_rate,
                 )
             ),
             argnums=(0, 1, 2),
@@ -1057,8 +1042,14 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     _, _, dv = vjp(do)
     dense_mask = jnp.array(mask[:, :])
     _, vjp_ref = jax.vjp(
-        lambda q, k, v: _dropout_reference(
-            q, k, v, dense_mask, dropout_mask, dropout_rate, is_mqa=False
+        lambda q, k, v: base.attention_reference(
+            q,
+            k,
+            v,
+            dense_mask,
+            dropout_mask=dropout_mask,
+            is_mqa=False,
+            dropout_rate=dropout_rate,
         ),
         q,
         k,
@@ -1115,6 +1106,69 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
     self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(1, 0, 0))))
     self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(0, 1, 0))))
     self.assertFalse(bool(jnp.array_equal(tile(0, 0, 0), tile(0, 0, 1))))
+
+  def test_reference_vjp_matches_autodiff_under_dropout(self):
+    """Covers the hand-written backward in `base.attention_reference_vjp`.
+
+    Reference against reference, no kernel involved: a manual backward has to
+    agree with autodiff of the forward it claims to differentiate, so the bound
+    here is float32 reassociation noise rather than flash-vs-dense error.
+
+    Matmul precision is pinned to "highest" because the manual backward
+    *recomputes* the logits. Under TPU's default bf16-pass f32 matmul the two
+    q@k products differ by ~1e-3 relative, which propagates into `p` and swamps
+    the thing being tested; the alternative --- a 1e-2 tolerance --- would pass
+    for a backward that had the dropout rescaling wrong.
+    """
+    dropout_rate = 0.25
+    q, k, v, do = self._inputs()
+    dense_mask = jnp.array(self._mask(is_causal=True)[:, :])
+    dropout_mask = jax.jit(
+        partial(
+            _get_dropout_mask,
+            self.NUM_HEADS,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+            self._config(dropout_rate),
+        )
+    )(random.key(11))
+
+    fwd = lambda q, k, v: base.attention_reference(
+        q,
+        k,
+        v,
+        dense_mask,
+        dropout_mask=dropout_mask,
+        is_mqa=False,
+        dropout_rate=dropout_rate,
+        save_residuals=True,
+    )
+    with jax.default_matmul_precision("highest"):
+      o, stats = fwd(q, k, v)
+      dq_ref, dk_ref, dv_ref, _ = base.attention_reference_vjp(
+          do,
+          q,
+          k,
+          v,
+          dense_mask,
+          None,
+          None,
+          o,
+          stats["logsumexp"],
+          dropout_mask,
+          is_mqa=False,
+          backward_impl="flash",
+          dropout_rate=dropout_rate,
+      )
+
+      grads = jax.grad(
+          lambda q, k, v: jnp.sum(fwd(q, k, v)[0] * do), argnums=(0, 1, 2)
+      )(q, k, v)
+    for name, g, g_ref in zip(
+        ("dq", "dk", "dv"), grads, (dq_ref, dk_ref, dv_ref)
+    ):
+      with self.subTest(name):
+        self.assertLess(_rel_l2(g, g_ref), 1e-5)
 
 
 if __name__ == "__main__":
