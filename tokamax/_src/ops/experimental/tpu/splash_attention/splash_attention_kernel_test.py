@@ -754,16 +754,20 @@ def _get_dropout_mask_kernel(
     *,
     bq: int,
     bkv_compute: int,
+    canonical_q: int,
+    canonical_kv: int,
     dropout_rate: float,
 ):
   # pylint: disable-next=protected-access
-  out_ref[...] = splash._generate_blockwise_dropout_mask(
+  out_ref[...] = splash._dropout_mask_tile(
       prng_key_ref,
       head_idx=pl.program_id(0),
       q_block_idx=pl.program_id(1),
       kv_block_idx=pl.program_id(2),
       q_block_size=bq,
       kv_block_size=bkv_compute,
+      canonical_q=canonical_q,
+      canonical_kv=canonical_kv,
       dropout_rate=dropout_rate,
   )
 
@@ -774,6 +778,8 @@ def _get_dropout_mask(
     kv_seq_len: int,
     config: splash.SplashConfig,
     prng_key: jax.Array,
+    bq: int | None = None,
+    bkv_compute: int | None = None,
 ) -> jax.Array:
   """Materializes the dropout mask the attention kernels generate internally.
 
@@ -782,12 +788,19 @@ def _get_dropout_mask(
   passed to the kernel, and `config` the same config, or the masks will not
   correspond.
 
+  `bq`/`bkv_compute` choose the tiling this materialization walks the matrix
+  with, defaulting to the canonical dropout grid. The result must not depend on
+  them --- that is the whole point of keying the mask on canonical coordinates
+  --- so passing them is how the tiling-invariance is tested.
+
   Returns:
     A [num_heads, q_seq_len, kv_seq_len] bool array; True means "dropped".
   """
   prng_key = pltpu.to_pallas_key(prng_key)
-  bq, bkv_compute = config.block_q, config.block_kv_compute
-  assert bkv_compute is not None
+  canonical_q, canonical_kv = config.dropout_block_q, config.dropout_block_kv
+  assert canonical_q is not None and canonical_kv is not None
+  bq = canonical_q if bq is None else bq
+  bkv_compute = canonical_kv if bkv_compute is None else bkv_compute
   grid = (num_heads, q_seq_len // bq, kv_seq_len // bkv_compute)
 
   kernel_name = "get_dropout_mask"
@@ -797,6 +810,8 @@ def _get_dropout_mask(
             _get_dropout_mask_kernel,
             bq=bq,
             bkv_compute=bkv_compute,
+            canonical_q=canonical_q,
+            canonical_kv=canonical_kv,
             dropout_rate=config.dropout_rate,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -848,8 +863,9 @@ def _restated_dropout_mask(
   `_get_dropout_mask` calls the kernel's own `_generate_blockwise_dropout_mask`,
   so on its own it can only show that the forward and backward passes agree with
   each other --- it cannot show that they agree with the *intended* scheme. This
-  spells the scheme out a second time: fold head, then q block, then kv block
-  into the key, in that order, and draw a (block_q, block_kv_compute) tile.
+  spells the scheme out a second time: fold head, then canonical q block, then
+  canonical kv block into the key, in that order, and draw a
+  (dropout_block_q, dropout_block_kv) tile.
 
   The two differ structurally on purpose. Here the grid is over heads alone and
   the block loop is unrolled inside the kernel with Python ints, so the block
@@ -862,8 +878,8 @@ def _restated_dropout_mask(
     A [num_heads, q_seq_len, kv_seq_len] bool array; True means "dropped".
   """
   prng_key = pltpu.to_pallas_key(prng_key)
-  bq, bkv = config.block_q, config.block_kv_compute
-  assert bkv is not None
+  bq, bkv = config.dropout_block_q, config.dropout_block_kv
+  assert bq is not None and bkv is not None
 
   return pl.pallas_call(
       partial(
@@ -1142,19 +1158,161 @@ class SplashAttentionDropoutTest(test_utils.SplashAttentionTestCase):
       with self.assertRaisesRegex(ValueError, "dropout_rate must be in"):
         self._config(rate)
 
-  def test_mismatched_fwd_bwd_blocks_raise(self):
-    """The bwd regenerates the mask, so its tiles must match the fwd's."""
+  def _mismatched_config(self, dropout_rate, fwd_mult, bwd_mult, **kwargs):
     block = self.BLOCK
-    with self.assertRaisesRegex(ValueError, "backward tiles to match"):
+    return splash.SplashConfig(
+        block_q=fwd_mult * block,
+        block_kv=fwd_mult * block,
+        block_kv_compute=fwd_mult * block,
+        block_q_dkv=bwd_mult * block,
+        block_kv_dkv=bwd_mult * block,
+        block_kv_dkv_compute=bwd_mult * block,
+        dropout_rate=dropout_rate,
+        use_base2_exp=False,
+        interpret=self.INTERPRET,
+        **kwargs,
+    )
+
+  def test_dropout_grid_defaults_to_the_finest_tiles(self):
+    """The default canonical grid is the coarsest both passes tile exactly."""
+    block = self.BLOCK
+    for fwd_mult, bwd_mult in ((1, 2), (2, 1), (1, 1), (4, 2)):
+      with self.subTest(f"fwd={fwd_mult}x_bwd={bwd_mult}x"):
+        config = self._mismatched_config(0.25, fwd_mult, bwd_mult)
+        expected = min(fwd_mult, bwd_mult) * block
+        self.assertEqual(config.dropout_block_q, expected)
+        self.assertEqual(config.dropout_block_kv, expected)
+
+  def test_dropout_mask_is_invariant_to_the_tiling(self):
+    """The same (head, q, kv) element draws the same bit at any tile size.
+
+    This is the property that lets the two passes disagree about block sizes:
+    the mask lives on the canonical grid, and a tile is only ever an assembly of
+    whole canonical blocks. Walked here at four tilings coarser than the
+    canonical 128x128 grid --- two of them non-square, so a q/kv transposition
+    in the assembly shows up --- against the canonical walk. Bit-exact: the
+    draws are literally the same draws, just grouped differently.
+
+    Materialized over 4x the test's sequence length rather than over SEQ_LEN.
+    The extent is independent of any attention shape here, and at SEQ_LEN the
+    coarsest tiling would be a single tile spanning the whole matrix: both
+    block indices are then 0, so scaling them into canonical units is a no-op
+    and that tiling cannot tell a correct scaling from a missing one.
+    """
+    config = self._config(0.5)
+    extent = 4 * self.SEQ_LEN
+    args = (self.NUM_HEADS, extent, extent, config)
+    key = random.key(3)
+    reference = jax.jit(partial(_get_dropout_mask, *args))(key)
+    block = self.BLOCK
+    for bq_mult, bkv_mult in ((2, 1), (1, 2), (2, 2), (4, 4)):
+      with self.subTest(f"{bq_mult}x{bkv_mult}"):
+        tiled = jax.jit(
+            partial(
+                _get_dropout_mask,
+                *args,
+                bq=bq_mult * block,
+                bkv_compute=bkv_mult * block,
+            )
+        )(key)
+        self._assert_array_equal(tiled, reference)
+
+  @parameterized.parameters((1, 2), (2, 1), (2, 4), (4, 2))
+  def test_mismatched_fwd_bwd_blocks_agree(self, fwd_mult, bwd_mult):
+    """End-to-end: fwd and bwd tiled differently still drop the same weights.
+
+    Same dv probe as `test_dropout_fwd_and_bwd_use_the_same_mask` --- dv is
+    exactly linear in the mask, so a backward that regenerated a *different*
+    realization would be wrong by O(rate) here --- but with the two passes
+    deliberately tiled 2x apart in both directions.
+    """
+    dropout_rate = 0.5
+    q, k, v, do = self._inputs()
+    mask = self._mask(is_causal=True)
+    config = self._mismatched_config(dropout_rate, fwd_mult, bwd_mult)
+    attn = self._attn(mask, config, is_mqa=False)
+    prng_key = random.key(7)
+    dropout_mask = jax.jit(
+        partial(
+            _get_dropout_mask,
+            self.NUM_HEADS,
+            self.SEQ_LEN,
+            self.SEQ_LEN,
+            config,
+        )
+    )(prng_key)
+
+    _, vjp = jax.vjp(partial(attn, prng_key=prng_key), q, k, v)
+    _, _, dv = vjp(do)
+    dense_mask = jnp.array(mask[:, :])
+    _, vjp_ref = jax.vjp(
+        lambda q, k, v: base.attention_reference(
+            q,
+            k,
+            v,
+            dense_mask,
+            dropout_mask=dropout_mask,
+            is_mqa=False,
+            dropout_rate=dropout_rate,
+        ),
+        q,
+        k,
+        v,
+    )
+    _, _, dv_ref = vjp_ref(do)
+    self._assert_allclose(dv, dv_ref, atol=5e-3, rtol=5e-3)
+
+  # Forward and backward block sizes from the tuned sweep, which picks them
+  # per pass and never lands on the same ones: (block_q, block_kv,
+  # block_kv_compute) forward, then the dkv trio. Under the old scheme every
+  # one of these was un-runnable with dropout on.
+  TUNED_BLOCKS = (
+      ("s4k_to_s32k", (512, 1024, 512), (2048, 2048, 512)),
+      ("s128k_d128", (512, 1024, 512), (1024, 4096, 512)),
+      ("s128k_d192", (512, 1024, 512), (2048, 1024, 1024)),
+      ("s128k_d256", (512, 1024, 512), (1024, 2048, 256)),
+  )
+
+  def test_tuned_block_sizes_are_expressible_with_dropout(self):
+    """The shipped block-size pairs must all admit a canonical dropout grid."""
+    for label, (bq, bkv, bkv_c), (bq_d, bkv_d, bkv_dc) in self.TUNED_BLOCKS:
+      with self.subTest(label):
+        config = splash.SplashConfig(
+            block_q=bq,
+            block_kv=bkv,
+            block_kv_compute=bkv_c,
+            block_q_dkv=bq_d,
+            block_kv_dkv=bkv_d,
+            block_kv_dkv_compute=bkv_dc,
+            dropout_rate=0.1,
+        )
+        gq, gkv = config.dropout_block_q, config.dropout_block_kv
+        self.assertEqual(gq, min(bq, bq_d))
+        self.assertEqual(gkv, min(bkv_c, bkv_dc))
+        # Both passes tile the canonical grid exactly, which is the property
+        # that makes them agree; the counts are what it costs to do so.
+        for tile, grid in ((bq, gq), (bq_d, gq), (bkv_c, gkv), (bkv_dc, gkv)):
+          self.assertEqual(tile % grid, 0)
+
+  def test_tiles_not_a_multiple_of_the_dropout_grid_raise(self):
+    """A tile that splits a canonical block would break the invariance."""
+    block = self.BLOCK
+    with self.assertRaisesRegex(ValueError, "block_q_dkv=192 to be a multiple"):
       splash.SplashConfig(
           block_q=block,
           block_kv=block,
           block_kv_compute=block,
-          block_q_dkv=2 * block,
+          block_q_dkv=block + block // 2,
           block_kv_dkv=block,
           block_kv_dkv_compute=block,
           dropout_rate=0.25,
       )
+    with self.assertRaisesRegex(
+        ValueError, "block_kv_compute=128 to be a multiple"
+    ):
+      self._mismatched_config(0.25, 1, 1, dropout_block_kv=48)
+    with self.assertRaisesRegex(ValueError, "dropout_block_q must be positive"):
+      self._mismatched_config(0.25, 1, 1, dropout_block_q=0)
 
   def test_get_dropout_mask_is_blockwise_and_head_dependent(self):
     """Different (head, q block, kv block) tiles must get independent draws."""

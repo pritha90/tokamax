@@ -127,6 +127,10 @@ def _generate_blockwise_dropout_mask(
   materializing the full [heads, q, kv] mask in HBM or saving it as a residual.
   True means "dropped".
 
+  The block coordinates are indices into the canonical dropout grid, which is
+  independent of the kernel's block sizes; callers go through
+  `_dropout_mask_tile` rather than calling this directly.
+
   The batch dimension is not folded in here: the kernels are written for a
   single batch element, so the caller is responsible for folding a batch index
   into `prng_key` before it reaches the kernel.
@@ -137,6 +141,62 @@ def _generate_blockwise_dropout_mask(
   sub_key = jax.random.fold_in(sub_key, kv_block_idx)
   return jax.random.bernoulli(sub_key, dropout_rate, (q_block_size,
                                                       kv_block_size))
+
+
+def _dropout_mask_tile(
+    prng_key: jax.Array,
+    *,
+    head_idx: jax.Array | int,
+    q_block_idx: jax.Array | int,
+    kv_block_idx: jax.Array | int,
+    q_block_size: int,
+    kv_block_size: int,
+    canonical_q: int,
+    canonical_kv: int,
+    dropout_rate: float,
+) -> jax.Array:
+  """Builds the [q_block_size, kv_block_size] dropout mask of one kernel tile.
+
+  The randomness lives on a fixed `canonical_q x canonical_kv` grid laid over
+  the whole attention matrix and is keyed by absolute canonical-block
+  coordinates, not by the kernel's own tiling. A tile is assembled from the
+  canonical blocks it covers, so an element's dropout bit is a function of its
+  (head, query, key) position alone -- the same property a dense mask array
+  indexed by absolute coordinates has, without materializing one. The forward
+  and the backward may therefore tile the attention matrix differently and
+  still agree on which weights were dropped.
+
+  Tile sizes are whole multiples of the canonical sizes (validated in
+  `SplashConfig.__post_init__`) and tile offsets are tile-aligned, so a
+  canonical block is never split across two tiles. When a tile size equals the
+  canonical size this collapses to a single draw keyed on the tile's own index,
+  i.e. it is bit-identical to keying on the tile directly.
+  """
+  nq, rem = divmod(q_block_size, canonical_q)
+  assert rem == 0, f"{q_block_size=} must be a multiple of {canonical_q=}"
+  nkv, rem = divmod(kv_block_size, canonical_kv)
+  assert rem == 0, f"{kv_block_size=} must be a multiple of {canonical_kv=}"
+
+  # Block indices, not element offsets: the canonical index of a tile's first
+  # block is exact without a division on a traced value.
+  q_base = q_block_idx * nq
+  kv_base = kv_block_idx * nkv
+  rows = []
+  for a in range(nq):
+    cols = [
+        _generate_blockwise_dropout_mask(
+            prng_key,
+            head_idx=head_idx,
+            q_block_idx=q_base + a,
+            kv_block_idx=kv_base + b,
+            q_block_size=canonical_q,
+            kv_block_size=canonical_kv,
+            dropout_rate=dropout_rate,
+        )
+        for b in range(nkv)
+    ]
+    rows.append(cols[0] if nkv == 1 else jnp.concatenate(cols, axis=1))
+  return rows[0] if nq == 1 else jnp.concatenate(rows, axis=0)
 
 
 def _check_dropout_args(
@@ -229,6 +289,20 @@ class SplashConfig:
   # saved for the backward pass. Requires a `prng_key`; 0.0 disables it and
   # leaves the kernel bit-identical to the no-dropout version.
   dropout_rate: float = 0.0
+  # Granularity, in (query, key) elements, of the grid the dropout mask is
+  # drawn on. Keying the mask on absolute canonical-block coordinates instead
+  # of on the kernel's own tiles is what lets the forward and the backward use
+  # different block sizes: each pass assembles its tile from the canonical
+  # blocks it covers, so both see the same bit for the same (head, query, key).
+  # The only requirement is that every tile size be a whole multiple of the
+  # corresponding canonical size. Defaults to the coarsest grid both passes can
+  # tile exactly -- the smaller of the two block sizes in each dimension --
+  # which leaves matched forward/backward tiles at one RNG draw per tile, as
+  # before. Set them smaller to decouple block-size pairs that are not
+  # multiples of one another, at the cost of more, smaller RNG calls per tile
+  # (the element count is unchanged).
+  dropout_block_q: int | None = None
+  dropout_block_kv: int | None = None
 
   def __post_init__(self):
     if not 0.0 <= self.dropout_rate < 1.0:
@@ -248,22 +322,32 @@ class SplashConfig:
     if not self.use_fused_bwd_kernel:
       raise ValueError("Only the fused bwd kernel is supported.")
 
-    if self.dropout_rate and self.has_backward_blocks:
-      # The mask is keyed on (q block index, kv compute block index) at a given
-      # tile size, and the backward regenerates rather than reloads it. If the
-      # backward tiles differ from the forward ones the two disagree on which
-      # weights were dropped, and the gradients are silently wrong.
-      if (self.block_q, self.block_kv_compute) != (
-          self.block_q_dkv,
-          self.block_kv_dkv_compute,
-      ):
-        raise ValueError(
-            "dropout_rate > 0 requires the backward tiles to match the forward"
-            f" ones: block_q={self.block_q} !="
-            f" block_q_dkv={self.block_q_dkv} or"
-            f" block_kv_compute={self.block_kv_compute} !="
-            f" block_kv_dkv_compute={self.block_kv_dkv_compute}."
-        )
+    if self.dropout_rate:
+      # The backward regenerates the mask rather than reloading it, so the two
+      # passes have to agree on which weights were dropped. They are keyed on a
+      # canonical grid of absolute coordinates instead of on their own tiles,
+      # which makes agreement independent of the tiling; all that is left to
+      # check is that each tile covers a whole number of canonical blocks.
+      q_tiles = {"block_q": self.block_q}
+      kv_tiles = {"block_kv_compute": self.block_kv_compute}
+      if self.has_backward_blocks:
+        q_tiles["block_q_dkv"] = self.block_q_dkv
+        kv_tiles["block_kv_dkv_compute"] = self.block_kv_dkv_compute
+
+      for axis, tiles in (("q", q_tiles), ("kv", kv_tiles)):
+        attr = f"dropout_block_{axis}"
+        canonical = getattr(self, attr)
+        if canonical is None:
+          canonical = min(tiles.values())
+          object.__setattr__(self, attr, canonical)
+        elif canonical <= 0:
+          raise ValueError(f"{attr} must be positive, got {canonical}.")
+        for name, tile in tiles.items():
+          if tile % canonical:
+            raise ValueError(
+                f"dropout_rate > 0 requires {name}={tile} to be a multiple of"
+                f" {attr}={canonical}."
+            )
 
     if self.qk_diag_skip:
       # The skip fills mask_value for sub-tiles where kv > q, relying on the mask to
@@ -639,13 +723,15 @@ def flash_attention_kernel(
       head_masks = []
       for head in range(num_stacked_q_heads):
         head_masks.append(
-            _generate_blockwise_dropout_mask(
+            _dropout_mask_tile(
                 prng_key_ref,
                 head_idx=h * num_stacked_q_heads + head,
                 q_block_idx=i,
                 kv_block_idx=global_kv_block_idx,
                 q_block_size=bq,
                 kv_block_size=bkv_compute,
+                canonical_q=config.dropout_block_q,
+                canonical_kv=config.dropout_block_kv,
                 dropout_rate=dropout_rate,
             )
         )
@@ -1609,17 +1695,21 @@ def _flash_attention_dkv_kernel(
     p = exp(qk - logsumexp)
 
     if dropout_rate:
-      # Regenerated, not saved: the same (head, q block, kv block) coordinates
-      # the forward used produce the same mask. Here the tile is [kv, q] rather
-      # than [q, kv], hence the transpose (only float32 transposes lower).
+      # Regenerated, not saved: the canonical blocks this tile covers are the
+      # same ones the forward covered over the same (query, key) range, so the
+      # bits match even though the backward tiles the matrix differently. Here
+      # the tile is [kv, q] rather than [q, kv], hence the transpose (only
+      # float32 transposes lower).
       global_kv_block_idx = kv_index * (bkv // bkv_compute) + i
-      dropout_mask = _generate_blockwise_dropout_mask(
+      dropout_mask = _dropout_mask_tile(
           prng_key_ref,
           head_idx=q_head,
           q_block_idx=q_index,
           kv_block_idx=global_kv_block_idx,
           q_block_size=bq,
           kv_block_size=bkv_compute,
+          canonical_q=config.dropout_block_q,
+          canonical_kv=config.dropout_block_kv,
           dropout_rate=dropout_rate,
       )
       dropout_mask = dropout_mask.astype(jnp.float32).T.astype(jnp.bool_)
