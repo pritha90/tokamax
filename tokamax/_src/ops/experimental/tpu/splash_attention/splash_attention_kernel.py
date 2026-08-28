@@ -234,7 +234,6 @@ def _dense_dropout_mask(
 def _check_dropout_args(
     config: "SplashConfig",
     prng_key: jax.Array | None,
-    mask_info: MaskInfo,
 ) -> jax.Array | None:
   """Validates the dropout arguments and converts the key for Pallas."""
   if not config.dropout_rate:
@@ -242,12 +241,6 @@ def _check_dropout_args(
   if prng_key is None:
     raise ValueError(
         "A prng_key is required when config.dropout_rate > 0; got None."
-    )
-  if mask_info.active_rows is None and config.num_stacked_q_heads > 1:
-    # Without the dynamic grid the q block index is recovered from the grid
-    # position, which assumes the dense (i, j) iteration order.
-    raise NotImplementedError(
-        "Dropout with num_stacked_q_heads > 1 requires the dynamic grid."
     )
   # A key passed as a regular operand fails to lower ("AssertionError:
   # key<pl>"), so it travels through scalar prefetch as a Pallas key instead.
@@ -884,7 +877,7 @@ def _splash_attention_forward(
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
   num_stacked_q_heads = config.num_stacked_q_heads
   raw_prng_key = prng_key
-  prng_key = _check_dropout_args(config, prng_key, mask_info)
+  prng_key = _check_dropout_args(config, prng_key)
 
   if num_stacked_q_heads > 1 and (
       sinks is not None or max_logit_value is not None
@@ -1907,7 +1900,7 @@ def _splash_attention_bwd_dkv(
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
   raw_prng_key = prng_key
-  prng_key = _check_dropout_args(config, prng_key, mask_info)
+  prng_key = _check_dropout_args(config, prng_key)
   dynamic_grid = mask_info.active_rows is not None
 
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
