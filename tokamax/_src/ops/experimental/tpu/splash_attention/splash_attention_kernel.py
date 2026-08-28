@@ -199,6 +199,38 @@ def _dropout_mask_tile(
   return rows[0] if nq == 1 else jnp.concatenate(rows, axis=0)
 
 
+def _dense_dropout_mask(
+    prng_key: jax.Array,
+    *,
+    num_q_heads: int,
+    q_seq_len: int,
+    kv_seq_len: int,
+    dropout_rate: float,
+) -> jax.Array:
+  """Materializes the whole [head, query, key] dropout mask in HBM.
+
+  The scheme `axlearn/common/flash_attention/gpu_attention.py` uses: one
+  `bernoulli` over the entire attention matrix, indexed by absolute
+  (head, query, key), streamed back into the kernel a tile at a time. Indexing
+  by absolute position is what makes it tiling-invariant, which is the only
+  thing it buys over generating the bits in-kernel.
+
+  It is here to be measured against the in-kernel path, not to be used. Mosaic
+  promotes the bool operand to s32, so the resident cost is
+  `4 * num_q_heads * q_seq_len * kv_seq_len` bytes --- 2.0G at 32 heads and
+  S=4096, 128G at S=32768 --- and a `(heads, bq, bkv)` tile of it overruns the
+  32M scoped-VMEM default on its own, so anything past S=4096 needs
+  `--xla_tpu_scoped_vmem_limit_kib` raised just to compile. End to end it runs
+  9-12x slower than regenerating in-kernel, essentially all of that in this
+  draw. What it does establish is that *applying* a mask costs only +30-43% in
+  either pass, so the backward's +172-194% is bit generation and not masking.
+  axlearn carries its own TODO to move to in-kernel RNG once Pallas supports it.
+  """
+  return jax.random.bernoulli(
+      prng_key, dropout_rate, (num_q_heads, q_seq_len, kv_seq_len)
+  )
+
+
 def _check_dropout_args(
     config: "SplashConfig",
     prng_key: jax.Array | None,
@@ -303,6 +335,13 @@ class SplashConfig:
   # (the element count is unchanged).
   dropout_block_q: int | None = None
   dropout_block_kv: int | None = None
+  # Draw the mask as a dense [head, query, key] array in HBM and stream tiles of
+  # it in, the way axlearn's `gpu_attention.py` does, instead of regenerating it
+  # in-kernel. Tiling-invariant for the same reason the canonical grid is --- the
+  # bit is a function of absolute position --- but at 4 * heads * q * kv bytes,
+  # which does not fit at the sequence lengths we care about. For measurement
+  # only; see `_dense_dropout_mask`.
+  dropout_dense_mask: bool = False
 
   def __post_init__(self):
     if not 0.0 <= self.dropout_rate < 1.0:
@@ -322,7 +361,7 @@ class SplashConfig:
     if not self.use_fused_bwd_kernel:
       raise ValueError("Only the fused bwd kernel is supported.")
 
-    if self.dropout_rate:
+    if self.dropout_rate and not self.dropout_dense_mask:
       # The backward regenerates the mask rather than reloading it, so the two
       # passes have to agree on which weights were dropped. They are keyed on a
       # canonical grid of absolute coordinates instead of on their own tiles,
@@ -518,6 +557,7 @@ def flash_attention_kernel(
     mask_ref,
     q_sequence_ref,
     max_logit_value_ref,
+    dropout_dense_ref,
     # Outputs
     o_ref,
     logsumexp_ref,
@@ -713,7 +753,12 @@ def flash_attention_kernel(
     # Dropout is applied *after* the running softmax denominator has been
     # accumulated from the undropped weights, so it does not renormalize over
     # the survivors: only the numerator (the s @ v product) sees the mask.
-    if dropout_rate:
+    if dropout_rate and config.dropout_dense_mask:
+      # Already drawn, in absolute coordinates. The BlockSpec brought in this
+      # tile's [head, bq, bkv] slab; take the current inner step's columns.
+      dropout_mask = dropout_dense_ref[:, :, slice_k]
+      s_curr = jnp.where(dropout_mask, 0.0, s_curr) / (1.0 - dropout_rate)
+    elif dropout_rate:
       global_kv_block_idx = j * (bkv // bkv_compute) + kv_compute_index
       # One mask per stacked head, assembled into the (heads, bq, bkv) tile:
       # writing them in with `.at[head].set` would lower to a scatter, which
@@ -838,6 +883,7 @@ def _splash_attention_forward(
   fuse_reciprocal = config.fuse_reciprocal or not save_residuals
   bounds_start, bounds_end = mask_info_lib.find_bounds(mask_info.active_rows)  # pyrefly: ignore[bad-argument-type]
   num_stacked_q_heads = config.num_stacked_q_heads
+  raw_prng_key = prng_key
   prng_key = _check_dropout_args(config, prng_key, mask_info)
 
   if num_stacked_q_heads > 1 and (
@@ -1051,6 +1097,24 @@ def _splash_attention_forward(
   else:
     in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
 
+  if config.dropout_rate and config.dropout_dense_mask:
+    dropout_dense = _dense_dropout_mask(
+        raw_prng_key,
+        num_q_heads=num_q_heads,
+        q_seq_len=q_seq_len,
+        kv_seq_len=kv_seq_len,
+        dropout_rate=config.dropout_rate,
+    )
+    in_specs.append(
+        pl.BlockSpec(
+            (num_stacked_q_heads, bq, bkv),
+            unravel(lambda h_block, i, j: (h_block, i, j)),
+        )
+    )
+  else:
+    dropout_dense = None
+    in_specs.append(None)  # pyrefly: ignore[bad-argument-type]
+
   out_shapes = [
       jax.ShapeDtypeStruct((num_q_heads, q_seq_len, head_dim_v), q.dtype),
   ]
@@ -1218,6 +1282,7 @@ def _splash_attention_forward(
         mask_info.partial_mask_blocks,
         q_sequence,
         max_logit_value,
+        dropout_dense,
     )
   out, logsumexp, l_linear, max_logits = all_out
 
@@ -1538,6 +1603,7 @@ def _flash_attention_dkv_kernel(
     di_ref,
     mask_ref,
     q_sequence_ref,
+    dropout_dense_ref,
     # aliases
     dq_alias,
     dk_alias,
@@ -1700,18 +1766,23 @@ def _flash_attention_dkv_kernel(
       # bits match even though the backward tiles the matrix differently. Here
       # the tile is [kv, q] rather than [q, kv], hence the transpose (only
       # float32 transposes lower).
-      global_kv_block_idx = kv_index * (bkv // bkv_compute) + i
-      dropout_mask = _dropout_mask_tile(
-          prng_key_ref,
-          head_idx=q_head,
-          q_block_idx=q_index,
-          kv_block_idx=global_kv_block_idx,
-          q_block_size=bq,
-          kv_block_size=bkv_compute,
-          canonical_q=config.dropout_block_q,
-          canonical_kv=config.dropout_block_kv,
-          dropout_rate=dropout_rate,
-      )
+      if config.dropout_dense_mask:
+        # Same [bq, bkv_compute] orientation the in-kernel path produces, so the
+        # transpose below is common to both and the comparison stays clean.
+        dropout_mask = dropout_dense_ref[:, slice_k]
+      else:
+        global_kv_block_idx = kv_index * (bkv // bkv_compute) + i
+        dropout_mask = _dropout_mask_tile(
+            prng_key_ref,
+            head_idx=q_head,
+            q_block_idx=q_index,
+            kv_block_idx=global_kv_block_idx,
+            q_block_size=bq,
+            kv_block_size=bkv_compute,
+            canonical_q=config.dropout_block_q,
+            canonical_kv=config.dropout_block_kv,
+            dropout_rate=dropout_rate,
+        )
       dropout_mask = dropout_mask.astype(jnp.float32).T.astype(jnp.bool_)
       # dv sees the dropped weights, matching the forward's numerator.
       pr = jnp.where(dropout_mask, 0.0, p) / (1.0 - dropout_rate)
@@ -1835,6 +1906,7 @@ def _splash_attention_bwd_dkv(
   num_q_heads, q_seq_len, head_dim_qk = q.shape
   kv_seq_len, head_dim_v = v.shape[-2:]
   num_kv_heads = 1 if is_mqa else k.shape[0]
+  raw_prng_key = prng_key
   prng_key = _check_dropout_args(config, prng_key, mask_info)
   dynamic_grid = mask_info.active_rows is not None
 
@@ -2021,6 +2093,21 @@ def _splash_attention_bwd_dkv(
     q_dtype = q.dtype if kv_steps <= 4 else jnp.float32
     dq_shape = jax.ShapeDtypeStruct((kv_steps, *q.shape), q_dtype)
 
+  if config.dropout_rate and config.dropout_dense_mask:
+    dropout_dense = _dense_dropout_mask(
+        raw_prng_key,
+        num_q_heads=num_q_heads,
+        q_seq_len=q_seq_len,
+        kv_seq_len=kv_seq_len,
+        dropout_rate=config.dropout_rate,
+    )
+    in_specs.append(
+        pl.BlockSpec((None, bq, bkv), unravel(lambda h, i, j: (h, i, j)))
+    )
+  else:
+    dropout_dense = None
+    in_specs.append(None)
+
   in_specs += [dq_alias_spec]
 
   if bkv == bkv_compute:
@@ -2099,6 +2186,7 @@ def _splash_attention_bwd_dkv(
       di,
       mask_info.partial_mask_blocks,
       q_sequence,
+      dropout_dense,
   ]
   num_args = sum(1 for x in args if x is not None)
   input_output_aliases = {}
