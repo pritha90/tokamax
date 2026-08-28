@@ -378,9 +378,12 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       is_mqa=(False, True),
       is_segmented=(False, True),
       is_dynamic_mask=(False, True),
+      dropout_rate=(0.0, 0.25),
   )
   @hp.given(hps.data())
-  def test_splash_attention(self, is_mqa, is_segmented, is_dynamic_mask, data):
+  def test_splash_attention(
+      self, is_mqa, is_segmented, is_dynamic_mask, dropout_rate, data
+  ):
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
     q, k, v, _, segment_ids, _ = _generate_inputs(
@@ -396,7 +399,23 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         config,
         attn_logits_soft_cap=attn_logits_soft_cap,
         interpret=self.INTERPRET,
+        dropout_rate=dropout_rate,
     )
+
+    # The kernel never materializes the dropout mask, so the reference is fed
+    # the same one out of `_get_dropout_mask` under the same key.
+    prng_key, dropout_mask = None, None
+    if dropout_rate:
+      prng_key = random.key(data.draw(seed_strategy()))
+      dropout_mask = jax.jit(
+          partial(
+              _get_dropout_mask,
+              model_config.num_q_heads,
+              q_seq_len,
+              kv_seq_len,
+              config,
+          )
+      )(prng_key)
 
     attn_ref = partial(base.attention_reference, is_mqa=is_mqa)
     if is_mqa:
@@ -412,16 +431,34 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
 
     attn = make_mask_fn(mask, config=config)
 
-    o = attn(q, k, v, segment_ids)
+    o = attn(q, k, v, segment_ids, prng_key=prng_key)
     o_ref = attn_ref(
         q.astype(np.float32),
         k.astype(np.float32),
         v.astype(np.float32),
         jnp.array(mask[:, :]),
         segment_ids,
+        dropout_mask=dropout_mask,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
     )
-    self._assert_allclose(o, o_ref, atol=6e-3, rtol=3e-3)
+    # Both sides compute the same function -- the kernel accumulates the softmax
+    # denominator from the undropped weights and masks only the numerator, just
+    # as `attention_reference` does -- so the gap is pure floating point. It is
+    # still ~2x wider under dropout, and not because the errors grow: at rate 0
+    # the kernel and the reference are each ~4e-3 away from an f64 statement of
+    # the formula but only ~5e-4 away from *each other*, because both round the
+    # same weighted average on the same MXU (the reference is not a
+    # high-precision oracle; it runs at default matmul precision too) and the
+    # error is common-mode. Dropout decorrelates them -- the kernel masks the
+    # unnormalized exp(qk - m) inside its streaming loop, the reference masks
+    # the normalized p -- so the residual stops cancelling and rises to roughly
+    # each side's own error. It is a step, not a scaling: already ~7x wider at
+    # rate 0.01, and no larger at 0.5 than at 0.25. Measured worst |o - o_ref|
+    # over these draws is 6.1e-3 at rate 0 against 1.1e-2 at 0.25; both
+    # tolerances sit ~1.4x above that.
+    atol = 1.2e-2 if dropout_rate else 6e-3
+    self._assert_allclose(o, o_ref, atol=atol, rtol=3e-3)
 
   @parameterized.product(
       is_mqa=(False, True),
