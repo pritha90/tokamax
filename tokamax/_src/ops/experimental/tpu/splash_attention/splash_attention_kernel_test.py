@@ -468,11 +468,13 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_max_logit_estimate=(None, "const", "value_1d", "value_2d"),
       fuse_reciprocal=(True, False),
       use_sinks=(False, True),
+      dropout_rate=(0.0, 0.25),
   )
   @hp.given(hps.data())
   def test_splash_attention_fwd(self, is_mqa, is_segmented, is_dynamic_mask,
                                 use_base2_exp, use_max_logit_estimate,
-                                fuse_reciprocal, use_sinks, data):
+                                fuse_reciprocal, use_sinks, dropout_rate,
+                                data):
     model_config = data.draw(model_config_strategy())
     q_seq_len, kv_seq_len = model_config.q_seq_len, model_config.kv_seq_len
     q, k, v, sinks, segment_ids, _ = _generate_inputs(
@@ -512,6 +514,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         use_base2_exp=use_base2_exp,
         interpret=self.INTERPRET,
         num_stacked_q_heads=num_stacked_q_heads,
+        dropout_rate=dropout_rate,
     )
 
     max_logit_value, max_val = None, 30.0
@@ -523,16 +526,41 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       max_logit_value = max_val * jnp.ones(
           (model_config.num_q_heads,), dtype=jnp.bfloat16
       )
+
+    # Materialized only after the last `replace`, so the canonical dropout grid
+    # is the one the kernel will actually key the mask on. `num_stacked_q_heads`
+    # is 2 for a good share of these cases, which is the path the stacked-head
+    # grid indexing needs covered.
+    prng_key, dropout_mask = None, None
+    if dropout_rate:
+      prng_key = random.key(data.draw(seed_strategy()))
+      dropout_mask = jax.jit(
+          partial(
+              _get_dropout_mask,
+              model_config.num_q_heads,
+              q_seq_len,
+              kv_seq_len,
+              config,
+          )
+      )(prng_key)
+
     attn = make_mask_fn(mask, config=config, save_residuals=True)
     attn_ref = partial(
         base.attention_reference,
         is_mqa=is_mqa,
         save_residuals=True,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
     )
 
     o, stats = attn(
-        q, k, v, segment_ids, sinks, max_logit_value=max_logit_value
+        q,
+        k,
+        v,
+        segment_ids,
+        sinks,
+        max_logit_value=max_logit_value,
+        prng_key=prng_key,
     )
 
     o_ref, stats_ref = attn_ref(
@@ -542,6 +570,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         jnp.array(mask[:, :]),
         segment_ids,
         sinks,
+        dropout_mask,
     )
 
     lse_tol = dict(atol=1e-3, rtol=3e-3)
@@ -554,6 +583,23 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       o_tol = dict(atol=8e-3, rtol=3e-3)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
+
+    if dropout_rate:
+      # `o` needs more room under dropout, and not because the kernel gets less
+      # accurate -- it doesn't. The reference writes `(s/l) @ v`, and at rate 0
+      # XLA hoists the `/l` out of the dot, so what actually runs is the
+      # kernel's own order and the two agree far better than the source
+      # suggests. Dropout puts a select and a rescale between the divide and
+      # the dot, which blocks that hoist; the reference then really does
+      # normalize first, which is the *less* accurate order. Measured on v7x,
+      # kernel-vs-reference goes 4.7e-4 -> 6.3e-3, roughly 4.6x from losing the
+      # hoist and another 2.8x from the 1/(1-rate) rescale. The zeroing itself
+      # contributes nothing. Only `o` moves: both sides take the residuals from
+      # the *undropped* weights -- the denominator is accumulated before the
+      # mask is applied -- so `logsumexp` and `max_logits` are untouched by
+      # dropout, and holding them at the unchanged tolerance is what asserts
+      # that.
+      o_tol = dict(o_tol, atol=2 * o_tol["atol"])
 
     self._assert_allclose(o, o_ref, **o_tol)
     self._assert_allclose(stats["logsumexp"],
@@ -571,6 +617,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       use_sinks=(False, True),
       dq_reduction_steps=(None, 3),
       save_residuals=(False, True),
+      dropout_rate=(0.0, 0.25),
   )
   @hp.given(hps.data())
   def test_splash_attention_bwd(
@@ -582,6 +629,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       dq_reduction_steps,
       use_sinks,
       save_residuals,
+      dropout_rate,
       data,
   ):
     downcast_smem_data = data.draw(hp.strategies.booleans())
@@ -609,6 +657,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         interpret=self.INTERPRET,
         use_base2_exp=use_base2_exp,
         dq_reduction_steps=dq_reduction_steps,
+        dropout_rate=dropout_rate,
     )
     if is_mqa:
       if not is_dynamic_mask:
@@ -631,6 +680,25 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
           (model_config.num_q_heads,), dtype=jnp.bfloat16
       )
 
+    # Materialized only after the last `replace`, so the canonical dropout
+    # grid is the one the kernel will actually key the mask on. The backward
+    # regenerates the mask from the key at its own (block_q_dkv,
+    # block_kv_dkv_compute) tiling, which the strategy draws independently of
+    # the forward blocks -- so every draw here doubles as a check that the two
+    # passes agree on which weights were dropped.
+    prng_key, dropout_mask = None, None
+    if dropout_rate:
+      prng_key = random.key(data.draw(seed_strategy()))
+      dropout_mask = jax.jit(
+          partial(
+              _get_dropout_mask,
+              model_config.num_q_heads,
+              q_seq_len,
+              kv_seq_len,
+              config,
+          )
+      )(prng_key)
+
     attn = make_mask_fn(
         mask,
         config=config,
@@ -640,7 +708,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
 
     if save_residuals:
       (o, stats), attn_vjp = jax.vjp(
-          partial(attn, max_logit_value=max_logit_value),
+          partial(attn, max_logit_value=max_logit_value, prng_key=prng_key),
           q,
           k,
           v,
@@ -650,7 +718,7 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       cotangents = (do, jax.tree.map(jnp.zeros_like, stats))
     else:
       o, attn_vjp = jax.vjp(
-          partial(attn, max_logit_value=max_logit_value),
+          partial(attn, max_logit_value=max_logit_value, prng_key=prng_key),
           q,
           k,
           v,
@@ -666,9 +734,11 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         jnp.array(mask[:, :]),
         segment_ids,
         sinks,
+        dropout_mask,
         is_mqa=is_mqa,
         save_residuals=True,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
     )
     if use_sinks:
       o_tol = dict(atol=1e-2, rtol=1e-2)
@@ -677,6 +747,13 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
       o_tol = dict(atol=8e-3, rtol=1e-2)
     else:
       o_tol = dict(atol=4e-3, rtol=3e-3)
+    if dropout_rate:
+      # Same mechanism as in the forward test: XLA hoists the reference's `/l`
+      # out of its dot at rate 0, so the two sides agree far better than the
+      # source suggests, and dropout's select and rescale block that hoist.
+      # Worst `o` over the backward sweep goes 1.0e-3 -> 6.3e-3, which the
+      # doubled atol covers with room to spare.
+      o_tol = dict(o_tol, atol=2 * o_tol["atol"])
     self._assert_allclose(o, o_ref, **o_tol)
 
     dq, dk, dv, _, dsinks = attn_vjp(cotangents)
@@ -690,16 +767,39 @@ class SplashAttentionTest(test_utils.SplashAttentionTestCase):
         sinks,
         o.astype(jnp.float32),
         stats_ref["logsumexp"],
+        dropout_mask,
         is_mqa=is_mqa,
         backward_impl="flash",
         attn_logits_soft_cap=attn_logits_soft_cap,
+        dropout_rate=dropout_rate,
     )
 
     dq_atol = 8e-2 if use_base2_exp else 2e-2
     dk_atol = 7e-2 if use_base2_exp else 2e-2
     dv_atol = 2e-2 if use_base2_exp else 2e-2
-    self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=3e-2)
-    self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=3e-2)
+    if dropout_rate:
+      # `dq` and `dk` need a norm check rather than an elementwise one, and not
+      # because dropout costs the kernel accuracy -- it doesn't. Every element
+      # of `dk` is a sum over all attending q positions, so its rounding error
+      # is set by the row's scale, and with segment ids and MQA the row norm
+      # exceeds a typical element by four decades (|dk_ref| median 1.6e-1, max
+      # 1.8e3). At rate 0 that costs nothing, because the error lands on the
+      # large elements that rtol already covers: measured
+      # corr(log|dk_ref|, log|err|) = +0.96. Dropout zeroes whichever term
+      # dominated a given element, so the element collapses to the residual of
+      # the rest while the accumulated rounding does not, and the same total
+      # error lands where there is no rtol budget -- on one 4096x4096 MQA draw
+      # max|dk - dk_ref| moves only 10.30 -> 10.62 while the atol it demands
+      # moves 5.3e-3 -> 2.4. The relative norm is the part that stays put
+      # (`dk` 8.0e-3 -> 1.4e-2, `dq` 1.5e-2 -> 1.4e-2 across the sweep), so
+      # assert on that. `dv` keeps the elementwise check: dropout enters it
+      # identically on both sides, and neither its error nor its correlation
+      # moves at all.
+      self.assertLess(_rel_l2(dq, dq_ref), 3e-2)
+      self.assertLess(_rel_l2(dk, dk_ref), 3e-2)
+    else:
+      self._assert_allclose(dq, dq_ref, atol=dq_atol, rtol=3e-2)
+      self._assert_allclose(dk, dk_ref, atol=dk_atol, rtol=3e-2)
     self._assert_allclose(dv, dv_ref, atol=dv_atol, rtol=3e-2)
     if use_sinks:
       self._assert_allclose(dsinks, dsinks_ref, atol=4e-3, rtol=6e-3)
